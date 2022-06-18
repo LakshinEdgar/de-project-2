@@ -1,219 +1,174 @@
-# Проект 1
-Опишите здесь поэтапно ход решения задачи. Вы можете ориентироваться на тот план выполнения проекта, который мы предлагаем в инструкции на платформе.!
-
-
-# Самостоятельный проект
-```bash
-docker run -d --rm -p 3030:3030 -p 3000:3000 -p 15432:5432 \
---name=de-project-sprint-1-server-local \
-sindb/project-sprint-1:latest
-```
-
-## Описание проекта
-В базе две схемы: production и analysis. В схеме production содержатся оперативные таблицы. В схему analysis необходимо разместить витрину, описание которой представлено ниже.
-
-Заказчик: компания, которая разрабатывает приложение по доставке еды.
-Цель проекта: построить витрину для RFM-классификации в схеме analysis. Для анализа нужно отобрать только успешно выполненные заказы (по статусом Closed).
-Описание:
-  - Наименование витрины: dm_rfm_segments
-  - БД: Витрина дожна располагаться в той же базе, что и исходники. 
-  - Схема: Витрина дожна располагаться в схеме analysis.
-  - Структура: Витрина должна состоять из таких полей:
-        user_id
-        recency (число от 1 до 5)
-        frequency (число от 1 до 5)
-        monetary_value (число от 1 до 5)
-  - Глубина данных: с начала 2021 года
-  - Частота обновления данных: обновления не нужны
-
-## Проверка качества данных
-- доступы ко всем таблицам есть
-- все колонки на месте
 
 ```SQL
-SELECT *
-FROM pg_catalog.pg_tables
-WHERE schemaname = 'production' AND tablename IN ('orderitems','orders','orderstatuses','orderstatuslog','products','users');
+-- Создайте справочник стоимости доставки в страны 
+DROP TABLE IF EXISTS public.shipping_country_rates CASCADE;
+CREATE TABLE public.shipping_country_rates (id SERIAL, 
+                                            shipping_country TEXT,
+                                            shipping_country_base_rate NUMERIC(14,3),
+                                            PRIMARY KEY (id)
+                                            );
+INSERT INTO public.shipping_country_rates (shipping_country,
+                                           shipping_country_base_rate
+                                           )
+SELECT DISTINCT shipping_country, 
+                shipping_country_base_rate
+FROM public.shipping;
+
+-- Создайте справочник тарифов доставки вендора по договору
+DROP TABLE IF EXISTS public.shipping_agreement CASCADE;
+CREATE TABLE public.shipping_agreement (agreementid BIGINT, 
+                                       agreement_number VARCHAR(20),
+                                       agreement_rate NUMERIC(14,3),
+                                       agreement_commission NUMERIC(14,3),
+                                       PRIMARY KEY (agreementid)
+                                        );
+INSERT INTO public.shipping_agreement (agreementid,
+                                       agreement_number,
+                                       agreement_rate,
+                                       agreement_commission
+                                       )
+SELECT DISTINCT (regexp_split_to_array(vendor_agreement_description, E'\\:+'))[1]::INT AS agreementid,
+                (regexp_split_to_array(vendor_agreement_description, E'\\:+'))[2]::VARCHAR(20) AS agreement_number,
+                (regexp_split_to_array(vendor_agreement_description, E'\\:+'))[3]::NUMERIC(14,3) AS agreement_rate,
+                (regexp_split_to_array(vendor_agreement_description, E'\\:+'))[4]::NUMERIC(14,3) AS agreement_commission
+FROM public.shipping;
+
+-- Создайте справочник о типах доставки
+DROP TABLE IF EXISTS public.shipping_transfer CASCADE;
+CREATE TABLE public.shipping_transfer (id SERIAL, 
+                                      transfer_type VARCHAR(20),
+                                      transfer_model VARCHAR(20),
+                                      shipping_transfer_rate NUMERIC(14,3),
+                                      PRIMARY KEY (id)
+                                      );
+INSERT INTO public.shipping_transfer (transfer_type,
+                                      transfer_model,
+                                      shipping_transfer_rate
+                                      )                                      
+SELECT DISTINCT (regexp_split_to_array(shipping_transfer_description, E'\\:+'))[1]::VARCHAR(20) AS transfer_type,
+                (regexp_split_to_array(shipping_transfer_description, E'\\:+'))[2]::VARCHAR(20) AS transfer_model,
+                shipping_transfer_rate::NUMERIC(14,3)
+FROM public.shipping;
+
+-- Создайте таблицу shipping_info с уникальными доставками shippingid
+DROP TABLE IF EXISTS public.shipping_info CASCADE;
+CREATE TABLE public.shipping_info (shippingid BIGINT,
+                                   vendorid BIGINT,
+                                   payment_amount NUMERIC(14,2),
+                                   shipping_plan_datetime TIMESTAMP,
+                                   transfer_type_id BIGINT,
+                                   agreementid BIGINT,
+                                   shipping_country_id BIGINT,
+                                   PRIMARY KEY (shippingid),
+                                   FOREIGN KEY (transfer_type_id) REFERENCES public.shipping_transfer(id) ON UPDATE CASCADE,
+                                   FOREIGN KEY (agreementid) REFERENCES public.shipping_agreement(agreementid) ON UPDATE CASCADE,
+                                   FOREIGN KEY (shipping_country_id) REFERENCES public.shipping_country_rates(id) ON UPDATE CASCADE
+                               );
+INSERT INTO public.shipping_info (shippingid,
+       vendorid,
+       payment_amount,
+       shipping_plan_datetime,
+       transfer_type_id,
+       agreementid,
+       shipping_country_id)
+       
+SELECT DISTINCT
+       shippingid::BIGINT,
+       vendorid::BIGINT,
+       payment_amount::NUMERIC(14,2),
+       shipping_plan_datetime::TIMESTAMP,
+       st.id::BIGINT AS transfer_type_id,
+       (regexp_split_to_array(vendor_agreement_description, E'\\:+'))[1]::BIGINT AS agreementid,
+       scr.id::BIGINT AS shipping_country_id
+FROM public.shipping AS s
+JOIN public.shipping_transfer AS st 
+     ON st.transfer_type=(regexp_split_to_array(s.shipping_transfer_description, E'\\:+'))[1]::VARCHAR(20) 
+     AND st.transfer_model=(regexp_split_to_array(s.shipping_transfer_description, E'\\:+'))[2]::VARCHAR(20)
+     AND st.shipping_transfer_rate = s.shipping_transfer_rate
+JOIN public.shipping_country_rates AS scr 
+     ON scr.shipping_country=s.shipping_country 
+     AND scr.shipping_country_base_rate=s.shipping_country_base_rate;
+
+ -- Создайте таблицу статусов о доставке shipping_status
+DROP TABLE IF EXISTS public.shipping_status CASCADE;
+CREATE TABLE public.shipping_status (shippingid BIGINT,
+                                     status VARCHAR(20),
+                                     state VARCHAR(20),
+                                     shipping_start_fact_datetime TIMESTAMP,
+                                     shipping_end_fact_datetime TIMESTAMP
+                                     ); 
+ 
+ WITH s AS (SELECT orderid,
+                  shippingid,
+                  status, 
+                  state,
+                  state_datetime,
+                  Row_number() over (partition by shippingid order by state_datetime DESC) as R
+           FROM public.shipping
+           ORDER BY orderid ASC,
+                    shippingid ASC,
+                    state_datetime ASC
+            ),
+sstart AS (SELECT shippingid,
+                  state_datetime AS shipping_start_fact_datetime
+           FROM public.shipping
+           WHERE state= 'booked' 
+           ORDER BY orderid ASC,
+                    shippingid ASC,
+                    state_datetime ASC
+           ),
+send AS (SELECT shippingid,
+                state_datetime AS shipping_end_fact_datetime
+         FROM public.shipping
+         WHERE state= 'recieved' 
+         ORDER BY orderid ASC,
+                  shippingid ASC,
+                  state_datetime ASC
+        )
+INSERT INTO public.shipping_status(shippingid,
+                                   status,
+                                   state,
+                                   shipping_start_fact_datetime,
+                                   shipping_end_fact_datetime)
+SELECT s.shippingid,
+       s.status,
+       s.state,
+       shipping_start_fact_datetime,
+       shipping_end_fact_datetime
+FROM s
+LEFT JOIN sstart ON sstart.shippingid=s.shippingid
+LEFT JOIN send ON send.shippingid=s.shippingid 
+WHERE R=1;
+
+--  Создайте представление shipping_datamart на основании готовых таблиц для аналитики и включите в него
+DROP VIEW IF EXISTS public.shipping_datamart;
+CREATE VIEW public.shipping_datamart AS
+SELECT
+si.shippingid,
+vendorid,
+transfer_type,
+EXTRACT(day FROM AGE(shipping_end_fact_datetime,shipping_start_fact_datetime)) AS full_day_at_shipping,
+CASE 
+    WHEN shipping_end_fact_datetime > shipping_plan_datetime THEN 1
+    ELSE 0
+END AS is_delay,
+CASE 
+    WHEN status='finished' THEN 1
+    ELSE 0
+END AS is_shipping_finish,
+CASE
+    WHEN shipping_end_fact_datetime > shipping_plan_datetime THEN EXTRACT(day FROM AGE(shipping_end_fact_datetime,shipping_plan_datetime)) 
+    ELSE 0
+END AS delay_day_at_shipping,
+payment_amount,
+payment_amount*(shipping_country_base_rate + agreement_rate + shipping_transfer_rate) AS vat,
+payment_amount*agreement_commission AS profit
+FROM public.shipping_info AS si
+LEFT JOIN public.shipping_transfer  AS st ON st.id = si.transfer_type_id 
+LEFT JOIN public.shipping_status AS ss ON ss.shippingid =si.shippingid 
+LEFT JOIN public.shipping_country_rates AS scr ON scr.id = si.shipping_country_id  
+LEFT JOIN public.shipping_agreement AS sa ON sa.agreementid =si.agreementid;
 ```
 
-- В таблице orders данные только за 2 месяца февраль и март 2022 года
-```SQL
-SELECT EXTRACT (YEAR FROM order_ts) order_ts_date,
-       EXTRACT (month FROM order_ts) order_ts_date,
-       SUM(payment)
-FROM production.orders vo
-GROUP BY 1,
-         2
-```
-
-- Месяцы тоже неполные. Заказы начинаются с середины февраля и заканчиваются в середине марта
-```SQL
-SELECT DATE_TRUNC('day',order_ts)::DATE as order_ts_date,
-       COUNT(user_id),
-       SUM(PAYMENT)
-FROM  production.orders vo
-LEFT JOIN production.orderstatuses vo2 on vo2.id = vo.status
-WHERE vo2.key='Closed' AND EXTRACT (YEAR FROM order_ts)>=2021
-GROUP BY 1
-```
-
-- Минимальное значение суммы заказа сильно отличается от среднего значения, но в динамике оно постоянное. Динамика среднtего значения и максимального сильно не меняется.
-Значения NULL отсутствуют в колонках user_id, order_id, status 
-```SQL
-WITH cte AS (SELECT user_id,
-                    order_id,
-                    status,
-                    DATE_TRUNC('day',order_ts)::DATE as order_ts_date,
-                    SUM(PAYMENT) AS sum_payment
-       FROM  production.orders vo
-       LEFT JOIN production.orderstatuses vo2 ON vo2.id = vo.status
-       WHERE vo2.key='Closed' AND EXTRACT (YEAR FROM order_ts)>=2021
-       GROUP BY 1,2,3,4)
-SELECT order_ts_date,
-       SUM(sum_payment)/COUNT(order_id) AS avg_order,
-       MIN(sum_payment) AS sum_payment_min,
-       MAX(sum_payment) AS sum_payment_max,
-       AVG(sum_payment) AS sum_payment_avg,
-       COUNT(CASE WHEN user_id IS NULL THEN 1 END) AS user_id_null,
-       COUNT(CASE WHEN order_id IS NULL THEN 1 END) AS order_idnull,
-       COUNT(CASE WHEN status IS NULL THEN 1 END) AS order_idnull
-FROM cte
-GROUP BY 1;
-```
-
-## Создание представлений
-```SQL 
-DROP VIEW IF EXISTS analysis.v_orders;
-CREATE VIEW analysis.v_orders AS
-SELECT order_id,
-       order_ts,
-       user_id,
-       bonus_payment,
-       payment,
-       cost,
-       bonus_grant,
-       status
-FROM production.orders;
-```
-
-```SQL
-DROP VIEW IF EXISTS analysis.v_orderitems;
-CREATE VIEW analysis.v_orderitems AS
-SELECT id,
-       product_id,
-       order_id,
-       name,
-       price,
-       discount,
-       quantity
-FROM production.orderitems;
-```
-
-```SQL
-DROP VIEW IF EXISTS analysis.v_orderstatuses;
-CREATE VIEW analysis.v_orderstatuses AS
-SELECT id,
-       key
-FROM production.orderstatuses;
-```
-
-```SQL
-DROP VIEW IF EXISTS analysis.v_products;
-CREATE VIEW analysis.v_products AS
-SELECT id,
-       name,
-       price
-FROM production.products;
-```
-
-```SQL
-DROP VIEW IF EXISTS analysis.v_users;
-CREATE VIEW analysis.v_users
-AS
-SELECT id,
-       name,
-       login
-FROM production.users;
-```
-
-## Создание витрины
-```SQL
-DROP TABLE IF EXISTS analysis.dm_rfm_segments;
-CREATE TABLE IF analysis.dm_rfm_segments (user_id serial PRIMARY KEY,
-                                                    recency int CHECK (recency BETWEEN 1 AND 5),
-                                                    frequency int CHECK (frequency BETWEEN 1 AND 5),
-                                                    monetary_value int (monetary_value BETWEEN 1 AND 5));
-```
-
-## Наполнение витрины
-```SQL
-with prev_ord as (SELECT order_id,
-                         user_id,
-                         order_ts::DATE AS order_ts_date,
-                         LAG(order_ts::DATE,1,order_ts::DATE) OVER (PARTITION BY user_id ORDER BY order_ts::DATE) AS prev_order_date,
-                         PAYMENT
-                  FROM analysis.v_orders vo
-                  LEFT JOIN analysis.v_orderstatuses vo2 ON vo2.id = vo.status
-                  WHERE vo2.key='Closed' AND EXTRACT (YEAR FROM order_ts)>=2021),
-rfm_raw as (SELECT user_id,
-                    MAX(order_ts_date)- MAX(prev_order_date) AS R,
-                    COUNT(*) as F,
-                    AVG(PAYMENT) AS M
-            FROM prev_ord po
-            GROUP BY 1)
-INSERT INTO analysis.dm_rfm_segments (user_id,
-                                      recency,
-                                      frequency,
-                                      monetary_value)
-SELECT user_id,
-       NTILE(5) OVER (ORDER BY R DESC) recency,
-       NTILE(5) OVER (ORDER BY F ASC) as frequency,
-       NTILE(5) OVER (ORDER BY M ASC) as monetary_value
-FROM rfm_raw;
-```
-
-## Создание представления после изменений команды Backend
-```SQL
-DROP VIEW IF EXISTS analysis.v_orderstatuslog;
-CREATE VIEW analysis.v_orderstatuslog AS
-SELECT id,
-       order_id ,
-       status_id,
-       dttm 
-FROM production.orderstatuslog;
-```
-
-## Наполнение витрины после изменений команды Backend
-```SQL
-TRUNCATE TABLE analysis.dm_rfm_segments;          
-WITH lsd AS (SELECT order_id,
-                    max(dttm) AS last_st_date
-             FROM analysis.v_orderstatuslog
-             GROUP BY 1),
-prev_ord AS (SELECT vo.order_id,
-                    user_id,
-                    order_ts::DATE AS order_ts_date,
-                    LAG(order_ts::DATE,1,order_ts::DATE) OVER (PARTITION BY user_id ORDER BY order_ts::DATE) AS prev_order_date,
-                    PAYMENT
-             FROM analysis.v_orders vo
-             INNER JOIN lsd ON vo.order_id=lsd.order_id
-             LEFT JOIN analysis.v_orderstatuses vo2 ON vo2.id = vo.status
-             WHERE vo2.key='Closed' AND EXTRACT (YEAR FROM order_ts)>=2021),
-rfm_raw AS (SELECT user_id,
-                   MAX(order_ts_date)- MAX(prev_order_date) AS R,
-                   COUNT(*) AS F,
-                   AVG(PAYMENT) AS M
-            FROM prev_ord po
-            GROUP BY 1)
-INSERT INTO analysis.dm_rfm_segments (user_id,
-                                      recency,
-                                      frequency,
-                                      monetary_value)            
-SELECT user_id,
-       NTILE(5) OVER (ORDER BY R DESC) recency,
-       NTILE(5) OVER (ORDER BY F ASC) as frequency,
-       NTILE(5) OVER (ORDER BY M ASC) as monetary_value
-FROM rfm_raw;
-```
 
 
